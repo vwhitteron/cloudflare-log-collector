@@ -1,0 +1,22 @@
+[Unit]
+Description=Cloudflare Log Collector (cflog)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cflog --config /usr/local/etc/cflog.conf
+Restart=on-failure
+RestartSec=30s
+
+User=cflog
+Group=cflog
+
+# Hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
