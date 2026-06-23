@@ -42,7 +42,7 @@ openobserve_user      = cflog@example.com
 openobserve_pass      = secret_password
 
 # Optional: remove or comment out if not required
-splunk_url            = https://splunk.example.com:1088/services/collector/event
+splunk_url            = https://splunk.example.com:8088/services/collector/event
 splunk_token          = secret-token
 ```
 

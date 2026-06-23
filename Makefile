@@ -68,7 +68,25 @@ lint:
 lint/fix:
 	@golangci-lint run --fix
 
-## build: build the cf2zo binary for Linux AMD64
+## build: build the cflog binary for Linux AMD64
 .PHONY: build
 build:
 	GOOS=linux GOARCH=amd64 go build -o ./out/cflog ./cflog.go
+
+
+# ==================================================================================== #
+# CONTAINER
+# ==================================================================================== #
+
+IMAGE ?= cflog
+TAG   ?= latest
+
+## docker/build: build the cflog container image (config baked in)
+.PHONY: docker/build
+docker/build:
+	docker build -t $(IMAGE):$(TAG) .
+
+## docker/run: run the cflog container image
+.PHONY: docker/run
+docker/run:
+	docker run --rm $(IMAGE):$(TAG)
