@@ -13,8 +13,11 @@ import (
 	"log/slog"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"text/template"
 	"time"
 
@@ -24,6 +27,17 @@ import (
 const (
 	defaultPollInterval = 900 * time.Second
 	httpClientTimeout   = 30 * time.Second
+
+	// gap-recovery defaults.
+	defaultMaxLookback = 72 * time.Hour // Cloudflare adaptive datasets retain ~72h.
+	healthCheckTimeout = 5 * time.Second
+	stateDirPerm       = 0o755
+
+	// dataset and output identifiers used to key per-output checkpoints.
+	datasetHTTP       = "http"
+	datasetR2         = "r2"
+	outputOpenObserve = "openobserve"
+	outputSplunk      = "splunk"
 
 	// simulation constants.
 	simMaxCount    = 5
@@ -47,7 +61,10 @@ const (
 	methodSelectorNone  = "(none)" // sentinel: method field not available
 )
 
-var errGraphQL = errors.New("GraphQL error")
+var (
+	errGraphQL      = errors.New("GraphQL error")
+	errMalformedURL = errors.New("malformed url")
+)
 
 type retryKind int
 
@@ -68,6 +85,9 @@ type Config struct {
 	SplunkURL       string
 	SplunkToken     string
 	PollInterval    time.Duration
+	StateFile       string
+	MaxLookback     time.Duration
+	BackfillChunk   time.Duration
 }
 
 // collector holds per-run mutable state shared across fetch/send operations.
@@ -75,14 +95,18 @@ type collector struct {
 	methodSelector string
 	zoneNames      map[string]string
 	disabledFields map[string]bool
-	lastEndTime    time.Time
-	lastR2EndTime  time.Time
+	store          *checkpointStore
+	// lastHealthy tracks the last observed health of each output, keyed by output
+	// name, so transitions are logged once rather than every tick.
+	lastHealthy map[string]bool
 }
 
-func newCollector() *collector {
+func newCollector(store *checkpointStore) *collector {
 	return &collector{
 		zoneNames:      make(map[string]string),
 		disabledFields: make(map[string]bool),
+		store:          store,
+		lastHealthy:    make(map[string]bool),
 	}
 }
 
@@ -151,6 +175,7 @@ func applyConfigKey(cfg *Config, key, value string) error {
 		"openobserve_pass":      &cfg.OpenObservePass,
 		"splunk_url":            &cfg.SplunkURL,
 		"splunk_token":          &cfg.SplunkToken,
+		"state_file":            &cfg.StateFile,
 	}
 
 	if ptr, ok := stringFields[key]; ok {
@@ -168,6 +193,20 @@ func applyConfigKey(cfg *Config, key, value string) error {
 		cfg.PollInterval, err = parsePollInterval(value)
 
 		return err
+	case "max_lookback":
+		d, err := time.ParseDuration(value)
+		if err != nil {
+			return fmt.Errorf("invalid max_lookback %q: %w", value, err)
+		}
+
+		cfg.MaxLookback = d
+	case "backfill_chunk":
+		d, err := time.ParseDuration(value)
+		if err != nil {
+			return fmt.Errorf("invalid backfill_chunk %q: %w", value, err)
+		}
+
+		cfg.BackfillChunk = d
 	}
 
 	return nil
@@ -208,11 +247,150 @@ func loadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("error reading config file %q: %w", path, err)
 	}
 
+	applyConfigDefaults(cfg)
+
+	return cfg, nil
+}
+
+// applyConfigDefaults fills in defaults for any unset configuration values.
+func applyConfigDefaults(cfg *Config) {
 	if cfg.PollInterval <= 0 {
 		cfg.PollInterval = defaultPollInterval
 	}
 
-	return cfg, nil
+	// An unset state_file leaves checkpoints in memory only, which disables
+	// gap recovery across restarts (checkpoints are lost on exit).
+
+	if cfg.MaxLookback <= 0 {
+		cfg.MaxLookback = defaultMaxLookback
+	}
+
+	// Default the backfill chunk to the poll interval: in steady state this is a
+	// single window, and it only subdivides when catching up after downtime.
+	if cfg.BackfillChunk <= 0 {
+		cfg.BackfillChunk = cfg.PollInterval
+	}
+}
+
+// checkpointStore persists the last successfully-delivered event time for each
+// (dataset, output) pair so the collector can resume without gaps after a
+// restart. Keys are "<dataset>.<output>", e.g. "http.splunk". A zero path keeps
+// state in memory only (useful for tests).
+type checkpointStore struct {
+	mu          sync.Mutex
+	path        string
+	checkpoints map[string]time.Time
+}
+
+func checkpointKey(dataset, output string) string {
+	return dataset + "." + output
+}
+
+// loadState reads the state file at path, returning an empty store if the file
+// does not exist yet. A corrupt file is a hard error so we don't silently reset
+// checkpoints and re-ingest history.
+func loadState(path string) (*checkpointStore, error) {
+	store := &checkpointStore{path: path, checkpoints: make(map[string]time.Time)}
+
+	if path == "" {
+		return store, nil
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return store, nil
+		}
+
+		return nil, fmt.Errorf("read state file %q: %w", path, err)
+	}
+
+	if len(data) == 0 {
+		return store, nil
+	}
+
+	err = json.Unmarshal(data, &store.checkpoints)
+	if err != nil {
+		return nil, fmt.Errorf("parse state file %q: %w", path, err)
+	}
+
+	return store, nil
+}
+
+func (s *checkpointStore) get(dataset, output string) time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.checkpoints[checkpointKey(dataset, output)]
+}
+
+// advance moves a checkpoint forward to when and persists. It never regresses a
+// checkpoint, so passing an older time is a no-op.
+func (s *checkpointStore) advance(dataset, output string, when time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := checkpointKey(dataset, output)
+	if !when.After(s.checkpoints[key]) {
+		return
+	}
+
+	s.checkpoints[key] = when
+
+	err := s.saveLocked()
+	if err != nil {
+		slog.Error("failed to persist checkpoint", "key", key, "err", err)
+	}
+}
+
+// saveLocked atomically writes the state file. Caller must hold s.mu.
+func (s *checkpointStore) saveLocked() error {
+	if s.path == "" {
+		return nil
+	}
+
+	data, err := json.MarshalIndent(s.checkpoints, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal state: %w", err)
+	}
+
+	dir := filepath.Dir(s.path)
+
+	err = os.MkdirAll(dir, stateDirPerm)
+	if err != nil {
+		return fmt.Errorf("create state dir %q: %w", dir, err)
+	}
+
+	tmp, err := os.CreateTemp(dir, ".state-*.json")
+	if err != nil {
+		return fmt.Errorf("create temp state file: %w", err)
+	}
+
+	tmpName := tmp.Name()
+
+	_, err = tmp.Write(data)
+	if err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+
+		return fmt.Errorf("write temp state file: %w", err)
+	}
+
+	err = tmp.Close()
+	if err != nil {
+		_ = os.Remove(tmpName)
+
+		return fmt.Errorf("close temp state file: %w", err)
+	}
+
+	err = os.Rename(tmpName, s.path)
+	if err != nil {
+		_ = os.Remove(tmpName)
+
+		return fmt.Errorf("rename state file: %w", err)
+	}
+
+	return nil
 }
 
 type Dimensions struct {
@@ -714,18 +892,10 @@ func (c *collector) fetchR2WithPagination(ctx context.Context, client *http.Clie
 	return logs, false
 }
 
-func (c *collector) fetchR2Logs(ctx context.Context, cfg *Config, simulate bool) []R2LogEntry {
-	if cfg.AccountID == "" {
-		slog.Debug("R2 collection skipped: no cloudflare_account_id configured")
-
-		return nil
-	}
-
-	if simulate {
-		return simulateR2Logs()
-	}
-
-	startTime, endTime := c.queryR2Window(cfg.PollInterval)
+// fetchR2Window fetches R2 logs for [startTime, endTime], retrying transient
+// failures. ok is false only when fetching ultimately failed, signalling the
+// caller not to advance any checkpoint.
+func (c *collector) fetchR2Window(ctx context.Context, cfg *Config, startTime, endTime time.Time) (entries []R2LogEntry, succeeded bool) {
 	client := &http.Client{Timeout: httpClientTimeout}
 
 	// Retry with exponential backoff for transient failures.
@@ -745,50 +915,72 @@ func (c *collector) fetchR2Logs(ctx context.Context, cfg *Config, simulate bool)
 			// Transient error — retry if we have retries left.
 			if retry == maxFetchRetries {
 				slog.Error("exhausted all retries for Cloudflare R2 fetch", "start", startTime, "end", endTime)
-				c.lastR2EndTime = endTime
 
-				return nil
+				return nil, false
 			}
 
 			continue
 		}
 
-		// Success (or graceful degradation) — advance the window.
-		c.lastR2EndTime = endTime
-
-		return logs
+		// Success (or graceful degradation).
+		return logs, true
 	}
 
 	// Should not reach here, but just in case.
-	slog.Error("fetchR2Logs exited unexpectedly")
+	slog.Error("fetchR2Window exited unexpectedly")
 
-	c.lastR2EndTime = endTime
-
-	return nil
+	return nil, false
 }
 
-func (c *collector) queryWindow(pollInterval time.Duration) (startTime, endTime time.Time) {
-	endTime = time.Now().UTC()
+// windowStart returns the lower bound of the fetch window: the oldest checkpoint
+// across the given outputs, clamped to now-MaxLookback. A zero checkpoint (never
+// delivered) means start one poll interval back, as before. now and the result
+// are UTC.
+func (c *collector) windowStart(dataset string, outputs []string, now time.Time, cfg *Config) time.Time {
+	oldest := now
 
-	if !c.lastEndTime.IsZero() {
-		startTime = c.lastEndTime
-	} else {
-		startTime = endTime.Add(-pollInterval)
+	for _, out := range outputs {
+		checkpoint := c.store.get(dataset, out)
+		if checkpoint.IsZero() {
+			checkpoint = now.Add(-cfg.PollInterval)
+		}
+
+		if checkpoint.Before(oldest) {
+			oldest = checkpoint
+		}
 	}
 
-	return startTime, endTime
+	if limit := now.Add(-cfg.MaxLookback); oldest.Before(limit) {
+		slog.Warn("backfill window exceeds max_lookback, clamping",
+			"dataset", dataset, "requested_start", oldest, "clamped_start", limit, "max_lookback", cfg.MaxLookback)
+
+		oldest = limit
+	}
+
+	return oldest
 }
 
-func (c *collector) queryR2Window(pollInterval time.Duration) (startTime, endTime time.Time) {
-	endTime = time.Now().UTC()
-
-	if !c.lastR2EndTime.IsZero() {
-		startTime = c.lastR2EndTime
-	} else {
-		startTime = endTime.Add(-pollInterval)
+// chunkBounds splits [start, end] into successive [chunkStart, chunkEnd] windows
+// no longer than chunk. In steady state this yields a single window; it only
+// subdivides when backfilling a gap after downtime.
+func chunkBounds(start, end time.Time, chunk time.Duration) [][2]time.Time {
+	if chunk <= 0 {
+		return [][2]time.Time{{start, end}}
 	}
 
-	return startTime, endTime
+	var bounds [][2]time.Time
+
+	for cur := start; cur.Before(end); {
+		next := cur.Add(chunk)
+		if next.After(end) {
+			next = end
+		}
+
+		bounds = append(bounds, [2]time.Time{cur, next})
+		cur = next
+	}
+
+	return bounds
 }
 
 func (c *collector) recordMethodSelector(selector string) {
@@ -804,12 +996,10 @@ func (c *collector) recordMethodSelector(selector string) {
 // maxPageDepth limits recursion when splitting time windows for pagination.
 const maxPageDepth = 8
 
-func (c *collector) fetchCloudflareLogs(ctx context.Context, cfg *Config, simulate bool) []LogEntry {
-	if simulate {
-		return simulateCloudFlareLogs()
-	}
-
-	startTime, endTime := c.queryWindow(cfg.PollInterval)
+// fetchHTTPWindow fetches HTTP request logs for [startTime, endTime], retrying
+// transient failures. ok is false only when fetching ultimately failed,
+// signalling the caller not to advance any checkpoint.
+func (c *collector) fetchHTTPWindow(ctx context.Context, cfg *Config, startTime, endTime time.Time) (entries []LogEntry, succeeded bool) {
 	zonesCall := buildZonesCall(cfg.ZoneIDs)
 	selectors := buildMethodSelectors(c.methodSelector)
 	client := &http.Client{Timeout: httpClientTimeout}
@@ -831,26 +1021,21 @@ func (c *collector) fetchCloudflareLogs(ctx context.Context, cfg *Config, simula
 			// Transient error — retry if we have retries left.
 			if retry == maxFetchRetries {
 				slog.Error("exhausted all retries for Cloudflare fetch", "start", startTime, "end", endTime)
-				c.lastEndTime = endTime
 
-				return nil
+				return nil, false
 			}
 
 			continue
 		}
 
-		// Success (or graceful degradation) — advance the window.
-		c.lastEndTime = endTime
-
-		return logs
+		// Success (or graceful degradation).
+		return logs, true
 	}
 
 	// Should not reach here, but just in case.
-	slog.Error("fetchCloudflareLogs exited unexpectedly")
+	slog.Error("fetchHTTPWindow exited unexpectedly")
 
-	c.lastEndTime = endTime
-
-	return nil
+	return nil, false
 }
 
 // fetchWithPagination fetches logs for [startTime, endTime], recursively splitting
@@ -994,9 +1179,12 @@ func doOpenObserveRequest(ctx context.Context, cfg *Config, body []byte) (int, e
 	return resp.StatusCode, nil
 }
 
-func (c *collector) sendToOpenObserve(ctx context.Context, cfg *Config, logs []LogEntry) {
-	if cfg.OpenObserveURL == "" || cfg.OpenObserveUser == "" || len(logs) == 0 {
-		return
+// sendToOpenObserve delivers logs and reports whether delivery succeeded. An
+// empty batch is a success (nothing to send for this window), so the caller
+// advances the checkpoint past an empty window.
+func (c *collector) sendToOpenObserve(ctx context.Context, cfg *Config, logs []LogEntry) bool {
+	if len(logs) == 0 {
+		return true
 	}
 
 	payload := make([]FlatLog, len(logs))
@@ -1008,23 +1196,25 @@ func (c *collector) sendToOpenObserve(ctx context.Context, cfg *Config, logs []L
 	if err != nil {
 		slog.Error("failed to marshal payload", "err", err)
 
-		return
+		return false
 	}
 
 	status, err := doOpenObserveRequest(ctx, cfg, body)
 	if err != nil {
 		slog.Error("OpenObserve request error", "err", err)
 
-		return
+		return false
 	}
 
 	if status < 200 || status >= 300 {
 		slog.Info("OpenObserve request failed", "count", len(payload), "status", status)
 
-		return
+		return false
 	}
 
 	slog.Debug("sent logs to OpenObserve", "count", len(payload), "status", status)
+
+	return true
 }
 
 func buildSplunkPayload(logs []LogEntry) (bytes.Buffer, error) {
@@ -1088,37 +1278,39 @@ func doSplunkRequest(ctx context.Context, cfg *Config, buf *bytes.Buffer) (int, 
 	return resp.StatusCode, nil
 }
 
-func (c *collector) sendToSplunk(ctx context.Context, cfg *Config, logs []LogEntry) {
-	if cfg.SplunkURL == "" || cfg.SplunkToken == "" || len(logs) == 0 {
-		return
+func (c *collector) sendToSplunk(ctx context.Context, cfg *Config, logs []LogEntry) bool {
+	if len(logs) == 0 {
+		return true
 	}
 
 	buf, err := buildSplunkPayload(logs)
 	if err != nil {
 		slog.Error("failed to build Splunk payload", "err", err)
 
-		return
+		return false
 	}
 
 	status, err := doSplunkRequest(ctx, cfg, &buf)
 	if err != nil {
 		slog.Error("Splunk request error", "err", err)
 
-		return
+		return false
 	}
 
 	if status < 200 || status >= 300 {
 		slog.Info("Splunk request failed", "count", len(logs), "status", status)
 
-		return
+		return false
 	}
 
 	slog.Debug("sent logs to Splunk", "count", len(logs), "status", status)
+
+	return true
 }
 
-func (c *collector) sendR2ToOpenObserve(ctx context.Context, cfg *Config, logs []R2LogEntry) {
-	if cfg.OpenObserveURL == "" || cfg.OpenObserveUser == "" || len(logs) == 0 {
-		return
+func (c *collector) sendR2ToOpenObserve(ctx context.Context, cfg *Config, logs []R2LogEntry) bool {
+	if len(logs) == 0 {
+		return true
 	}
 
 	payload := make([]R2FlatLog, len(logs))
@@ -1130,23 +1322,25 @@ func (c *collector) sendR2ToOpenObserve(ctx context.Context, cfg *Config, logs [
 	if err != nil {
 		slog.Error("failed to marshal R2 payload", "err", err)
 
-		return
+		return false
 	}
 
 	status, err := doOpenObserveRequest(ctx, cfg, body)
 	if err != nil {
 		slog.Error("OpenObserve R2 request error", "err", err)
 
-		return
+		return false
 	}
 
 	if status < 200 || status >= 300 {
 		slog.Info("OpenObserve R2 request failed", "count", len(payload), "status", status)
 
-		return
+		return false
 	}
 
 	slog.Debug("sent R2 logs to OpenObserve", "count", len(payload), "status", status)
+
+	return true
 }
 
 func buildR2SplunkPayload(logs []R2LogEntry) (bytes.Buffer, error) {
@@ -1184,32 +1378,310 @@ func buildR2SplunkPayload(logs []R2LogEntry) (bytes.Buffer, error) {
 	return buf, nil
 }
 
-func (c *collector) sendR2ToSplunk(ctx context.Context, cfg *Config, logs []R2LogEntry) {
-	if cfg.SplunkURL == "" || cfg.SplunkToken == "" || len(logs) == 0 {
-		return
+func (c *collector) sendR2ToSplunk(ctx context.Context, cfg *Config, logs []R2LogEntry) bool {
+	if len(logs) == 0 {
+		return true
 	}
 
 	buf, err := buildR2SplunkPayload(logs)
 	if err != nil {
 		slog.Error("failed to build R2 Splunk payload", "err", err)
 
-		return
+		return false
 	}
 
 	status, err := doSplunkRequest(ctx, cfg, &buf)
 	if err != nil {
 		slog.Error("R2 Splunk request error", "err", err)
 
-		return
+		return false
 	}
 
 	if status < 200 || status >= 300 {
 		slog.Info("R2 Splunk request failed", "count", len(logs), "status", status)
 
-		return
+		return false
 	}
 
 	slog.Debug("sent R2 logs to Splunk", "count", len(logs), "status", status)
+
+	return true
+}
+
+// enabledOutputs returns the configured destinations, in a stable order.
+func enabledOutputs(cfg *Config) []string {
+	var outputs []string
+
+	if cfg.OpenObserveURL != "" && cfg.OpenObserveUser != "" {
+		outputs = append(outputs, outputOpenObserve)
+	}
+
+	if cfg.SplunkURL != "" && cfg.SplunkToken != "" {
+		outputs = append(outputs, outputSplunk)
+	}
+
+	return outputs
+}
+
+// healthBaseURL returns scheme://host[:port] for raw, used to build probe URLs
+// from an ingest endpoint that includes a path.
+func healthBaseURL(raw string) (string, error) {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("parse url %q: %w", raw, err)
+	}
+
+	if parsed.Scheme == "" || parsed.Host == "" {
+		return "", fmt.Errorf("%w: %q", errMalformedURL, raw)
+	}
+
+	return parsed.Scheme + "://" + parsed.Host, nil
+}
+
+// probe issues a short-timeout GET and reports whether the endpoint answered
+// with a 2xx status. setup may set auth headers / transport.
+func probe(ctx context.Context, rawURL string, setup func(*http.Request, *http.Client)) bool {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return false
+	}
+
+	client := &http.Client{Timeout: healthCheckTimeout}
+
+	if setup != nil {
+		setup(req, client)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return false
+	}
+
+	defer func() { _ = resp.Body.Close() }()
+
+	return resp.StatusCode >= 200 && resp.StatusCode < 300
+}
+
+// outputHealthy probes a single destination's health endpoint. There is no point
+// fetching (and certainly not backfilling) for a destination we cannot reach.
+func outputHealthy(ctx context.Context, cfg *Config, output string) bool {
+	switch output {
+	case outputOpenObserve:
+		base, err := healthBaseURL(cfg.OpenObserveURL)
+		if err != nil {
+			slog.Debug("cannot derive OpenObserve health URL", "err", err)
+
+			return false
+		}
+
+		return probe(ctx, base+"/healthz", func(req *http.Request, _ *http.Client) {
+			authStr := base64.StdEncoding.EncodeToString([]byte(cfg.OpenObserveUser + ":" + cfg.OpenObservePass))
+			req.Header.Set("Authorization", "Basic "+authStr)
+		})
+	case outputSplunk:
+		base, err := healthBaseURL(cfg.SplunkURL)
+		if err != nil {
+			slog.Debug("cannot derive Splunk health URL", "err", err)
+
+			return false
+		}
+
+		return probe(ctx, base+"/services/collector/health", func(req *http.Request, client *http.Client) {
+			req.Header.Set("Authorization", "Splunk "+cfg.SplunkToken)
+
+			client.Transport = &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // Splunk often uses self-signed certs
+			}
+		})
+	default:
+		return false
+	}
+}
+
+// healthyOutputs probes each output and returns those currently reachable,
+// logging health transitions once rather than every tick.
+func (c *collector) healthyOutputs(ctx context.Context, cfg *Config, outputs []string) []string {
+	var healthy []string
+
+	for _, out := range outputs {
+		reachable := outputHealthy(ctx, cfg, out)
+
+		if prev, seen := c.lastHealthy[out]; !seen || prev != reachable {
+			if reachable {
+				slog.Info("output healthy", "output", out)
+			} else {
+				slog.Warn("output unhealthy, skipping until reachable", "output", out)
+			}
+		}
+
+		c.lastHealthy[out] = reachable
+
+		if reachable {
+			healthy = append(healthy, out)
+		}
+	}
+
+	return healthy
+}
+
+// afterCheckpoint returns the entries whose RFC3339Nano timestamp (from getTime)
+// is strictly after checkpoint. A zero checkpoint keeps everything. Strict
+// comparison dedupes events lying exactly on a chunk boundary already delivered
+// in the prior chunk.
+func afterCheckpoint[T any](entries []T, checkpoint time.Time, getTime func(T) string) []T {
+	if checkpoint.IsZero() {
+		return entries
+	}
+
+	var out []T
+
+	for _, entry := range entries {
+		when, err := time.Parse(time.RFC3339Nano, getTime(entry))
+		if err != nil {
+			// Keep entries with unparseable timestamps rather than drop data.
+			out = append(out, entry)
+
+			continue
+		}
+
+		if when.After(checkpoint) {
+			out = append(out, entry)
+		}
+	}
+
+	return out
+}
+
+// processHTTP fetches and delivers HTTP request logs for the current tick,
+// gating on per-output health and advancing each output's checkpoint only on
+// confirmed delivery.
+func (c *collector) processHTTP(ctx context.Context, cfg *Config, simulate bool) {
+	outputs := enabledOutputs(cfg)
+	if len(outputs) == 0 {
+		return
+	}
+
+	// Probe outputs for observability only. The probe targets a secondary health
+	// endpoint distinct from the ingest path, so a probe failure is a weak signal;
+	// gating ingest on it can suppress delivery to an output that accepts writes
+	// fine. Delivery success is the authoritative signal and the only thing that
+	// advances a checkpoint, so attempt every enabled output and let failed
+	// deliveries simply not advance.
+	c.healthyOutputs(ctx, cfg, outputs)
+
+	now := time.Now().UTC()
+
+	if simulate {
+		logs := simulateCloudFlareLogs()
+		c.deliverHTTP(ctx, cfg, outputs, logs, now)
+
+		return
+	}
+
+	start := c.windowStart(datasetHTTP, outputs, now, cfg)
+
+	for _, bound := range chunkBounds(start, now, cfg.BackfillChunk) {
+		logs, succeeded := c.fetchHTTPWindow(ctx, cfg, bound[0], bound[1])
+		if !succeeded {
+			// Leave checkpoints untouched; retry from the same point next tick.
+			return
+		}
+
+		slog.Info("collected Cloudflare HTTP logs",
+			"count", len(logs), "start", bound[0], "end", bound[1])
+
+		c.deliverHTTP(ctx, cfg, outputs, logs, bound[1])
+	}
+}
+
+// deliverHTTP sends the chunk's logs to each healthy output (filtered to events
+// newer than that output's checkpoint) and advances the checkpoint to chunkEnd
+// only when delivery succeeds.
+func (c *collector) deliverHTTP(ctx context.Context, cfg *Config, healthy []string, logs []LogEntry, chunkEnd time.Time) {
+	for _, out := range healthy {
+		checkpoint := c.store.get(datasetHTTP, out)
+		if !chunkEnd.After(checkpoint) {
+			continue // output already past this chunk
+		}
+
+		filtered := afterCheckpoint(logs, checkpoint, func(e LogEntry) string { return e.Dimensions.Datetime })
+
+		var delivered bool
+
+		switch out {
+		case outputOpenObserve:
+			delivered = c.sendToOpenObserve(ctx, cfg, filtered)
+		case outputSplunk:
+			delivered = c.sendToSplunk(ctx, cfg, filtered)
+		}
+
+		if delivered {
+			c.store.advance(datasetHTTP, out, chunkEnd)
+		}
+	}
+}
+
+// processR2 mirrors processHTTP for R2 storage logs.
+func (c *collector) processR2(ctx context.Context, cfg *Config, simulate bool) {
+	if cfg.AccountID == "" {
+		slog.Debug("R2 collection skipped: no cloudflare_account_id configured")
+
+		return
+	}
+
+	outputs := enabledOutputs(cfg)
+	if len(outputs) == 0 {
+		return
+	}
+
+	// Advisory probe only; deliver to every enabled output. See processHTTP.
+	c.healthyOutputs(ctx, cfg, outputs)
+
+	now := time.Now().UTC()
+
+	if simulate {
+		c.deliverR2(ctx, cfg, outputs, simulateR2Logs(), now)
+
+		return
+	}
+
+	start := c.windowStart(datasetR2, outputs, now, cfg)
+
+	for _, bound := range chunkBounds(start, now, cfg.BackfillChunk) {
+		logs, succeeded := c.fetchR2Window(ctx, cfg, bound[0], bound[1])
+		if !succeeded {
+			return
+		}
+
+		slog.Info("collected Cloudflare R2 logs",
+			"count", len(logs), "start", bound[0], "end", bound[1])
+
+		c.deliverR2(ctx, cfg, outputs, logs, bound[1])
+	}
+}
+
+func (c *collector) deliverR2(ctx context.Context, cfg *Config, healthy []string, logs []R2LogEntry, chunkEnd time.Time) {
+	for _, out := range healthy {
+		checkpoint := c.store.get(datasetR2, out)
+		if !chunkEnd.After(checkpoint) {
+			continue
+		}
+
+		filtered := afterCheckpoint(logs, checkpoint, func(e R2LogEntry) string { return e.Dimensions.Datetime })
+
+		var delivered bool
+
+		switch out {
+		case outputOpenObserve:
+			delivered = c.sendR2ToOpenObserve(ctx, cfg, filtered)
+		case outputSplunk:
+			delivered = c.sendR2ToSplunk(ctx, cfg, filtered)
+		}
+
+		if delivered {
+			c.store.advance(datasetR2, out, chunkEnd)
+		}
+	}
 }
 
 func (c *collector) fetchAllZoneIDs(ctx context.Context, cfg *Config) ([]string, error) {
@@ -1297,12 +1769,22 @@ func (c *collector) resolveAndLogZones(ctx context.Context, cfg *Config) {
 	}
 }
 
+// version is the build version, overridable at link time with
+// -ldflags "-X main.version=<value>". Defaults to "dev" for local builds.
+var version = "dev"
+
 func main() {
 	configPath := flag.StringP("config", "c", "/etc/cf2zo.conf", "path to config file")
 	simulate := flag.BoolP("simulate", "s", false, "send simulated logs instead of fetching from Cloudflare")
 	debug := flag.BoolP("debug", "d", false, "enable debug logging")
+	showVersion := flag.BoolP("version", "v", false, "print version and exit")
 
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("cflog", version)
+		os.Exit(0)
+	}
 
 	level := slog.LevelInfo
 	if *debug {
@@ -1311,6 +1793,8 @@ func main() {
 
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: level})))
 
+	slog.Info("starting cflog", "version", version)
+
 	cfg, err := loadConfig(*configPath)
 	if err != nil {
 		slog.Error("failed to load config", "err", err)
@@ -1318,9 +1802,21 @@ func main() {
 	}
 
 	ctx := context.Background()
-	col := newCollector()
 
-	slog.Info("streaming Cloudflare logs")
+	store, err := loadState(cfg.StateFile)
+	if err != nil {
+		slog.Error("failed to load state file", "err", err)
+		os.Exit(1)
+	}
+
+	col := newCollector(store)
+
+	if cfg.StateFile == "" {
+		slog.Warn("state_file not set, gap recovery across restarts is disabled")
+	}
+
+	slog.Info("streaming Cloudflare logs", "state_file", cfg.StateFile,
+		"max_lookback", cfg.MaxLookback, "backfill_chunk", cfg.BackfillChunk)
 
 	if cfg.OpenObserveURL == "" && cfg.SplunkURL == "" {
 		slog.Warn("no destinations configured", "hint", "set openobserve_url or splunk_url")
@@ -1336,15 +1832,8 @@ func main() {
 				}
 			}()
 
-			// Fetch and send HTTP request logs
-			logs := col.fetchCloudflareLogs(ctx, cfg, *simulate)
-			col.sendToOpenObserve(ctx, cfg, logs)
-			col.sendToSplunk(ctx, cfg, logs)
-
-			// Fetch and send R2 storage logs
-			r2Logs := col.fetchR2Logs(ctx, cfg, *simulate)
-			col.sendR2ToOpenObserve(ctx, cfg, r2Logs)
-			col.sendR2ToSplunk(ctx, cfg, r2Logs)
+			col.processHTTP(ctx, cfg, *simulate)
+			col.processR2(ctx, cfg, *simulate)
 		}()
 		time.Sleep(cfg.PollInterval)
 	}

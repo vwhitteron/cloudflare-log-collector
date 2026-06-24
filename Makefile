@@ -68,10 +68,12 @@ lint:
 lint/fix:
 	@golangci-lint run --fix
 
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+
 ## build: build the cflog binary for Linux AMD64
 .PHONY: build
 build:
-	GOOS=linux GOARCH=amd64 go build -o ./out/cflog ./cflog.go
+	GOOS=linux GOARCH=amd64 go build -ldflags="-X main.version=$(VERSION)" -o ./out/cflog ./cflog.go
 
 
 # ==================================================================================== #
@@ -84,7 +86,7 @@ TAG   ?= latest
 ## docker/build: build the cflog container image (config baked in)
 .PHONY: docker/build
 docker/build:
-	docker build -t $(IMAGE):$(TAG) .
+	docker build --build-arg VERSION=$(VERSION) -t $(IMAGE):$(TAG) .
 
 ## docker/run: run the cflog container image
 .PHONY: docker/run

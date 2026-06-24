@@ -44,7 +44,24 @@ openobserve_pass      = secret_password
 # Optional: remove or comment out if not required
 splunk_url            = https://splunk.example.com:8088/services/collector/event
 splunk_token          = secret-token
+
+# Gap recovery (all optional)
+state_file            = /var/opt/cflog/state.json  # per-output checkpoints; unset disables persistence
+max_lookback          = 72h                        # cap on backfill after downtime (default 72h)
+backfill_chunk        = 15m                        # fetch window size; defaults to poll_interval
 ```
+
+### Gap recovery
+
+Delivery progress is tracked **per output** (OpenObserve, Splunk) and persisted to
+`state_file` (leave it unset to keep checkpoints in memory only, which disables
+recovery across restarts). After a restart — or after an output has been unreachable — the
+collector backfills everything since that output's last successful write, in
+`backfill_chunk`-sized windows, up to `max_lookback` (Cloudflare's adaptive
+datasets retain roughly 72h, so older gaps cannot be recovered). Each tick the
+collector health-checks every configured output first and only fetches for those
+currently reachable, so an output that is down never causes data to be skipped —
+its checkpoint simply waits and catches up once it returns.
 
 ## Usage
 

@@ -12,6 +12,9 @@ RestartSec=30s
 User=cflog
 Group=cflog
 
+ExecStartPre=+/usr/bin/install -d -o cflog -g cflog -m 0750 /var/opt/cflog
+ReadWritePaths=/var/opt/cflog
+
 # Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
