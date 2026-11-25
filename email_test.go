@@ -1,6 +1,7 @@
 package main
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -52,10 +53,12 @@ func TestProcessEmailAttempt(t *testing.T) {
 		{"zoneTag":"z2","emailRoutingAdaptive":[{"datetime":"2026-01-01T00:00:01Z","sessionId":"b"},{"datetime":"2026-01-01T00:00:02Z","sessionId":"c"}]}
 	]}}}`)
 
-	logs, err := col.processEmailAttempt(body)
+	groups, err := col.processEmailAttempt(body)
 	if err != nil {
 		t.Fatal(err)
 	}
+
+	logs := slices.Concat(groups...)
 
 	if len(logs) != 3 {
 		t.Fatalf("got %d logs, want 3", len(logs))

@@ -48,8 +48,12 @@ const (
 	simMaxRequests = 5
 	simFlagValues  = 2 // a 0/1 flag has two values
 
-	nanosPerSecond   = 1e9
-	pageSplitDivisor = 2
+	nanosPerSecond = 1e9
+
+	// pagination constants.
+	pageLimit        = 10000               // maxPageSize for all three datasets
+	maxQueryDuration = 30 * 24 * time.Hour // maximum span of a single query
+	sendBatchSize    = 1000                // rows per request to an output
 
 	// retry constants for failed fetches.
 	maxFetchRetries = 3
@@ -90,7 +94,6 @@ type Config struct {
 	PollInterval    time.Duration
 	StateFile       string
 	MaxLookback     time.Duration
-	BackfillChunk   time.Duration
 
 	EmailRouting        bool
 	EmailIncludeSubject bool
@@ -223,12 +226,7 @@ func applyConfigKey(cfg *Config, key, value string) error {
 
 		cfg.MaxLookback = d
 	case "backfill_chunk":
-		d, err := time.ParseDuration(value)
-		if err != nil {
-			return fmt.Errorf("invalid backfill_chunk %q: %w", value, err)
-		}
-
-		cfg.BackfillChunk = d
+		slog.Warn("backfill_chunk is deprecated and ignored; pagination is automatic")
 	}
 
 	return nil
@@ -285,12 +283,6 @@ func applyConfigDefaults(cfg *Config) {
 
 	if cfg.MaxLookback <= 0 {
 		cfg.MaxLookback = defaultMaxLookback
-	}
-
-	// Default the backfill chunk to the poll interval: in steady state this is a
-	// single window, and it only subdivides when catching up after downtime.
-	if cfg.BackfillChunk <= 0 {
-		cfg.BackfillChunk = cfg.PollInterval
 	}
 }
 
@@ -542,9 +534,6 @@ func simulateCloudFlareLogs() []LogEntry {
 	return logs
 }
 
-// emailPageLimit is the maximum page size for emailRoutingAdaptive.
-const emailPageLimit = 10000
-
 // EmailLogEntry is a single Email Routing event from emailRoutingAdaptive.
 type EmailLogEntry struct {
 	ZoneTag        string `json:"zoneTag"`
@@ -683,7 +672,7 @@ func buildGraphQLQuery(zonesCall, methodSelector string, startTime, endTime time
   viewer {
     {{.ZonesCall}} {
       zoneTag
-      httpRequestsAdaptiveGroups(limit: 1000, filter: {datetime_geq: "{{.Start}}", datetime_leq: "{{.End}}", requestSource: "eyeball"}) {
+      httpRequestsAdaptiveGroups(limit: {{.Limit}}, orderBy: [datetime_ASC], filter: {datetime_geq: "{{.Start}}", datetime_leq: "{{.End}}", requestSource: "eyeball"}) {
         count
         dimensions {
           datetime
@@ -713,6 +702,7 @@ func buildGraphQLQuery(zonesCall, methodSelector string, startTime, endTime time
 
 	err := template.Must(template.New("cfgql").Parse(tmplText)).Execute(&buf, map[string]string{
 		"ZonesCall":          zonesCall,
+		"Limit":              strconv.Itoa(pageLimit),
 		"MethodSelector":     methodSel,
 		"Start":              startTime.Format(time.RFC3339Nano),
 		"End":                endTime.Format(time.RFC3339Nano),
@@ -745,7 +735,7 @@ func buildR2GraphQLQuery(accountID string, startTime, endTime time.Time) string 
 	const tmplText = `{
   viewer {
     accounts(filter: {accountTag: "{{.AccountID}}"}) {
-      r2StorageAdaptiveGroups(limit: 1000, filter: {datetime_geq: "{{.Start}}", datetime_leq: "{{.End}}"}) {
+      r2StorageAdaptiveGroups(limit: {{.Limit}}, orderBy: [datetime_ASC], filter: {datetime_geq: "{{.Start}}", datetime_leq: "{{.End}}"}) {
         dimensions {
           datetime
           bucketName
@@ -765,6 +755,7 @@ func buildR2GraphQLQuery(accountID string, startTime, endTime time.Time) string 
 
 	err := template.Must(template.New("r2gql").Parse(tmplText)).Execute(&buf, map[string]string{
 		"AccountID": accountID,
+		"Limit":     strconv.Itoa(pageLimit),
 		"Start":     startTime.Format(time.RFC3339Nano),
 		"End":       endTime.Format(time.RFC3339Nano),
 	})
@@ -815,7 +806,7 @@ func buildEmailGraphQLQuery(zoneIDs []string, includeSubject bool, startTime, en
 
 	err := template.Must(template.New("emailgql").Parse(tmplText)).Execute(&buf, map[string]any{
 		"ZonesCall":      buildZonesCall(zoneIDs),
-		"Limit":          emailPageLimit,
+		"Limit":          pageLimit,
 		"IncludeSubject": includeSubject,
 		"Start":          startTime.Format(time.RFC3339Nano),
 		"End":            endTime.Format(time.RFC3339Nano),
@@ -929,8 +920,9 @@ func (c *collector) processError(msg, selector string, selectors []string, attem
 	return retryNone, fmt.Errorf("%w: %s", errGraphQL, msg)
 }
 
-// processGraphQLAttempt parses a response body and extracts log entries.
-func (c *collector) processGraphQLAttempt(body []byte, selector string, selectors []string, attempt int) ([]LogEntry, retryKind, error) {
+// processGraphQLAttempt parses a response body and extracts log entries, grouped
+// per zone so pagination can detect which zones returned a full page.
+func (c *collector) processGraphQLAttempt(body []byte, selector string, selectors []string, attempt int) ([][]LogEntry, retryKind, error) {
 	var result graphQLResponse
 
 	err := json.Unmarshal(body, &result)
@@ -950,23 +942,27 @@ func (c *collector) processGraphQLAttempt(body []byte, selector string, selector
 		return nil, retryNone, nil
 	}
 
-	var logs []LogEntry
+	groups := make([][]LogEntry, 0, len(result.Data.Viewer.Zones))
 
 	for _, zone := range result.Data.Viewer.Zones {
+		group := make([]LogEntry, 0, len(zone.HTTPRequestsAdaptiveGroups))
+
 		for _, entry := range zone.HTTPRequestsAdaptiveGroups {
 			entry.Dimensions.ZoneTag = zone.ZoneTag
 			entry.Dimensions.ZoneName = c.zoneNames[zone.ZoneTag]
 			entry.Sum.Requests = entry.Count
-			logs = append(logs, entry)
+			group = append(group, entry)
 		}
+
+		groups = append(groups, group)
 	}
 
-	return logs, retryNone, nil
+	return groups, retryNone, nil
 }
 
-// processR2Attempt parses an R2 response body and extracts log entries.
-// processR2Attempt parses an R2 response body and extracts log entries.
-func (c *collector) processR2Attempt(body []byte) ([]R2LogEntry, error) {
+// processR2Attempt parses an R2 response body and extracts log entries, grouped
+// per account.
+func (c *collector) processR2Attempt(body []byte) ([][]R2LogEntry, error) {
 	var result r2GraphQLResponse
 
 	err := json.Unmarshal(body, &result)
@@ -984,23 +980,26 @@ func (c *collector) processR2Attempt(body []byte) ([]R2LogEntry, error) {
 		return nil, nil
 	}
 
-	var logs []R2LogEntry
+	groups := make([][]R2LogEntry, 0, len(result.Data.Viewer.Accounts))
+	total := 0
 
 	for _, account := range result.Data.Viewer.Accounts {
-		logs = append(logs, account.R2StorageAdaptiveGroups...)
+		groups = append(groups, account.R2StorageAdaptiveGroups)
+		total += len(account.R2StorageAdaptiveGroups)
 	}
 
-	if len(logs) == 0 {
+	if total == 0 {
 		slog.Debug("no R2 logs yet, waiting for traffic")
 
 		return nil, nil
 	}
 
-	return logs, nil
+	return groups, nil
 }
 
-// processEmailAttempt parses an Email Routing response body and extracts log entries.
-func (c *collector) processEmailAttempt(body []byte) ([]EmailLogEntry, error) {
+// processEmailAttempt parses an Email Routing response body and extracts log
+// entries, grouped per zone.
+func (c *collector) processEmailAttempt(body []byte) ([][]EmailLogEntry, error) {
 	var result emailGraphQLResponse
 
 	err := json.Unmarshal(body, &result)
@@ -1012,23 +1011,29 @@ func (c *collector) processEmailAttempt(body []byte) ([]EmailLogEntry, error) {
 		return nil, fmt.Errorf("%w: %s", errGraphQL, result.Errors[0].Message)
 	}
 
-	var logs []EmailLogEntry
+	groups := make([][]EmailLogEntry, 0, len(result.Data.Viewer.Zones))
+	total := 0
 
 	for _, zone := range result.Data.Viewer.Zones {
+		group := make([]EmailLogEntry, 0, len(zone.EmailRoutingAdaptive))
+
 		for _, entry := range zone.EmailRoutingAdaptive {
 			entry.ZoneTag = zone.ZoneTag
 			entry.ZoneName = c.zoneNames[zone.ZoneTag]
-			logs = append(logs, entry)
+			group = append(group, entry)
 		}
+
+		groups = append(groups, group)
+		total += len(group)
 	}
 
-	if len(logs) == 0 {
+	if total == 0 {
 		slog.Debug("no email logs yet, waiting for traffic")
 
 		return nil, nil
 	}
 
-	return logs, nil
+	return groups, nil
 }
 
 // dedupeEmail removes duplicate events (same sessionId and datetime),
@@ -1051,11 +1056,11 @@ func dedupeEmail(entries []EmailLogEntry) []EmailLogEntry {
 	return out
 }
 
-// fetchEmailWithPagination fetches Email Routing logs for [startTime, endTime],
-// recursively splitting the window when the API returns a full page.
-func (c *collector) fetchEmailWithPagination(ctx context.Context, client *http.Client, cfg *Config,
-	startTime, endTime time.Time, depth int,
-) ([]EmailLogEntry, bool) {
+// fetchEmailPage fetches one page of Email Routing logs for [startTime, endTime],
+// grouped per zone. failed is true on a transient failure.
+func (c *collector) fetchEmailPage(ctx context.Context, client *http.Client, cfg *Config,
+	startTime, endTime time.Time,
+) (groups [][]EmailLogEntry, failed bool) {
 	query := buildEmailGraphQLQuery(cfg.ZoneIDs, cfg.EmailIncludeSubject, startTime, endTime)
 
 	body, status, err := doGraphQLRequest(ctx, client, cfg, query)
@@ -1073,39 +1078,22 @@ func (c *collector) fetchEmailWithPagination(ctx context.Context, client *http.C
 		return nil, true // transient failure
 	}
 
-	logs, err := c.processEmailAttempt(body)
+	groups, err = c.processEmailAttempt(body)
 	if err != nil {
 		slog.Error("process email response failed", "err", err)
 
 		return nil, true // transient failure
 	}
 
-	if len(logs) == emailPageLimit && depth < maxPageDepth {
-		slog.Info("hit row limit for email, splitting time window",
-			"limit", emailPageLimit, "depth", depth, "start", startTime, "end", endTime)
-		mid := startTime.Add(endTime.Sub(startTime) / pageSplitDivisor)
-
-		half1, failed1 := c.fetchEmailWithPagination(ctx, client, cfg, startTime, mid, depth+1)
-		half2, failed2 := c.fetchEmailWithPagination(ctx, client, cfg, mid, endTime, depth+1)
-
-		if failed1 || failed2 {
-			return nil, true
-		}
-
-		result := make([]EmailLogEntry, 0, len(half1)+len(half2))
-		result = append(result, half1...)
-		result = append(result, half2...)
-
-		return result, false
-	}
-
-	return logs, false
+	return groups, false
 }
 
-// fetchEmailWindow fetches Email Routing logs for [startTime, endTime], retrying
-// transient failures. succeeded is false only when fetching ultimately failed,
-// signalling the caller not to advance any checkpoint.
-func (c *collector) fetchEmailWindow(ctx context.Context, cfg *Config, startTime, endTime time.Time) (entries []EmailLogEntry, succeeded bool) {
+// fetchEmailWindow fetches one page of Email Routing logs starting at startTime
+// (no later than endTime), retrying transient failures. pageEnd is the last
+// instant the returned rows cover and more reports whether further pages remain.
+// ok is false only when fetching ultimately failed, signalling the caller not to
+// advance any checkpoint.
+func (c *collector) fetchEmailWindow(ctx context.Context, cfg *Config, startTime, endTime time.Time) (entries []EmailLogEntry, pageEnd time.Time, more, ok bool) {
 	client := &http.Client{Timeout: httpClientTimeout}
 
 	for retry := 0; retry <= maxFetchRetries; retry++ {
@@ -1117,31 +1105,34 @@ func (c *collector) fetchEmailWindow(ctx context.Context, cfg *Config, startTime
 			time.Sleep(delay)
 		}
 
-		logs, fetchFailed := c.fetchEmailWithPagination(ctx, client, cfg, startTime, endTime, 0)
+		groups, fetchFailed := c.fetchEmailPage(ctx, client, cfg, startTime, endTime)
 
 		if fetchFailed {
 			if retry == maxFetchRetries {
 				slog.Error("exhausted all retries for Cloudflare email fetch", "start", startTime, "end", endTime)
 
-				return nil, false
+				return nil, time.Time{}, false, false
 			}
 
 			continue
 		}
 
-		return dedupeEmail(logs), true
+		logs, end, hasMore := trimPage(groups, pageLimit, startTime, endTime,
+			func(e EmailLogEntry) time.Time { return parseDatetime(e.Datetime) })
+
+		return dedupeEmail(logs), end, hasMore, true
 	}
 
 	slog.Error("fetchEmailWindow exited unexpectedly")
 
-	return nil, false
+	return nil, time.Time{}, false, false
 }
 
-// fetchR2WithPagination fetches R2 logs for [startTime, endTime], recursively splitting
-// the window when the API returns 1000 rows (the limit).
-func (c *collector) fetchR2WithPagination(ctx context.Context, client *http.Client, cfg *Config,
-	startTime, endTime time.Time, depth int,
-) ([]R2LogEntry, bool) {
+// fetchR2Page fetches one page of R2 logs for [startTime, endTime], grouped per
+// account. failed is true on a transient failure.
+func (c *collector) fetchR2Page(ctx context.Context, client *http.Client, cfg *Config,
+	startTime, endTime time.Time,
+) (groups [][]R2LogEntry, failed bool) {
 	query := buildR2GraphQLQuery(cfg.AccountID, startTime, endTime)
 
 	body, status, err := doGraphQLRequest(ctx, client, cfg, query)
@@ -1159,39 +1150,19 @@ func (c *collector) fetchR2WithPagination(ctx context.Context, client *http.Clie
 		return nil, true // transient failure
 	}
 
-	logs, err := c.processR2Attempt(body)
+	groups, err = c.processR2Attempt(body)
 	if err != nil {
 		slog.Error("process R2 response failed", "err", err)
 
 		return nil, true // transient failure
 	}
 
-	// Check if we hit the 1000-row limit — if so, split the window and paginate.
-	if len(logs) == 1000 && depth < maxPageDepth {
-		slog.Info("hit 1000-row limit for R2, splitting time window", "depth", depth, "start", startTime, "end", endTime)
-		mid := startTime.Add(endTime.Sub(startTime) / pageSplitDivisor)
-
-		half1, failed1 := c.fetchR2WithPagination(ctx, client, cfg, startTime, mid, depth+1)
-		half2, failed2 := c.fetchR2WithPagination(ctx, client, cfg, mid, endTime, depth+1)
-
-		if failed1 || failed2 {
-			return nil, true
-		}
-
-		result := make([]R2LogEntry, 0, len(half1)+len(half2))
-		result = append(result, half1...)
-		result = append(result, half2...)
-
-		return result, false
-	}
-
-	return logs, false
+	return groups, false
 }
 
-// fetchR2Window fetches R2 logs for [startTime, endTime], retrying transient
-// failures. ok is false only when fetching ultimately failed, signalling the
-// caller not to advance any checkpoint.
-func (c *collector) fetchR2Window(ctx context.Context, cfg *Config, startTime, endTime time.Time) (entries []R2LogEntry, succeeded bool) {
+// fetchR2Window fetches one page of R2 logs starting at startTime (no later than
+// endTime), retrying transient failures. See fetchEmailWindow for the results.
+func (c *collector) fetchR2Window(ctx context.Context, cfg *Config, startTime, endTime time.Time) (entries []R2LogEntry, pageEnd time.Time, more, ok bool) {
 	client := &http.Client{Timeout: httpClientTimeout}
 
 	// Retry with exponential backoff for transient failures.
@@ -1205,40 +1176,42 @@ func (c *collector) fetchR2Window(ctx context.Context, cfg *Config, startTime, e
 			time.Sleep(delay)
 		}
 
-		logs, fetchFailed := c.fetchR2WithPagination(ctx, client, cfg, startTime, endTime, 0)
+		groups, fetchFailed := c.fetchR2Page(ctx, client, cfg, startTime, endTime)
 
 		if fetchFailed {
 			// Transient error — retry if we have retries left.
 			if retry == maxFetchRetries {
 				slog.Error("exhausted all retries for Cloudflare R2 fetch", "start", startTime, "end", endTime)
 
-				return nil, false
+				return nil, time.Time{}, false, false
 			}
 
 			continue
 		}
 
-		// Success (or graceful degradation).
-		return logs, true
+		logs, end, hasMore := trimPage(groups, pageLimit, startTime, endTime,
+			func(e R2LogEntry) time.Time { return parseDatetime(e.Dimensions.Datetime) })
+
+		return logs, end, hasMore, true
 	}
 
 	// Should not reach here, but just in case.
 	slog.Error("fetchR2Window exited unexpectedly")
 
-	return nil, false
+	return nil, time.Time{}, false, false
 }
 
 // windowStart returns the lower bound of the fetch window: the oldest checkpoint
 // across the given outputs, clamped to now-MaxLookback. A zero checkpoint (never
-// delivered) means start one poll interval back, as before. now and the result
-// are UTC.
+// delivered) means backfill all of max_lookback. now and the result are UTC.
 func (c *collector) windowStart(dataset string, outputs []string, now time.Time, cfg *Config) time.Time {
 	oldest := now
 
 	for _, out := range outputs {
 		checkpoint := c.store.get(dataset, out)
 		if checkpoint.IsZero() {
-			checkpoint = now.Add(-cfg.PollInterval)
+			// First delivery for this output: get all available history.
+			checkpoint = now.Add(-cfg.MaxLookback)
 		}
 
 		if checkpoint.Before(oldest) {
@@ -1256,27 +1229,135 @@ func (c *collector) windowStart(dataset string, outputs []string, now time.Time,
 	return oldest
 }
 
-// chunkBounds splits [start, end] into successive [chunkStart, chunkEnd] windows
-// no longer than chunk. In steady state this yields a single window; it only
-// subdivides when backfilling a gap after downtime.
-func chunkBounds(start, end time.Time, chunk time.Duration) [][2]time.Time {
-	if chunk <= 0 {
-		return [][2]time.Time{{start, end}}
+// parseDatetime parses an RFC3339Nano timestamp, returning the zero time when
+// it cannot be parsed.
+func parseDatetime(value string) time.Time {
+	t, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return time.Time{}
 	}
 
-	var bounds [][2]time.Time
+	return t
+}
 
-	for cur := start; cur.Before(end); {
-		next := cur.Add(chunk)
-		if next.After(end) {
-			next = end
+// fullGroupCursor returns the earliest last-row time over groups that reached
+// limit rows (and so may have been truncated). Groups whose last time cannot be
+// parsed are ignored.
+func fullGroupCursor[T any](groups [][]T, limit int, getTime func(T) time.Time) (cursor time.Time, found bool) {
+	for _, group := range groups {
+		if len(group) < limit || len(group) == 0 {
+			continue
 		}
 
-		bounds = append(bounds, [2]time.Time{cur, next})
-		cur = next
+		last := getTime(group[len(group)-1])
+		if last.IsZero() {
+			continue
+		}
+
+		if !found || last.Before(cursor) {
+			cursor = last
+			found = true
+		}
 	}
 
-	return bounds
+	return cursor, found
+}
+
+// trimPage cuts a page so that it ends at a safe cursor.
+// groups holds the rows for each zone (or one group for an account), each sorted
+// by time ascending. A group with limit rows may have been truncated by the API,
+// so rows at or after the earliest such group's last timestamp are dropped and
+// re-fetched by the next page starting at that cursor. Rows whose time cannot be
+// parsed (zero time) are kept, consistent with afterCheckpoint.
+func trimPage[T any](groups [][]T, limit int, pageStart, windowEnd time.Time, getTime func(T) time.Time) (rows []T, pageEnd time.Time, more bool) {
+	cursor, haveCursor := fullGroupCursor(groups, limit, getTime)
+
+	if !haveCursor {
+		return filterRows(groups, getTime, func(time.Time) bool { return true }), windowEnd, false
+	}
+
+	if cursor.After(pageStart) {
+		rows = filterRows(groups, getTime, func(when time.Time) bool { return when.Before(cursor) })
+
+		return rows, cursor.Add(-time.Nanosecond), true
+	}
+
+	// No progress: more than limit rows share a single timestamp. Keep what we
+	// have and move past it; the remainder cannot be reached.
+	slog.Warn("page limit reached within a single timestamp, rows may be lost",
+		"limit", limit, "cursor", cursor, "start", pageStart)
+
+	rows = filterRows(groups, getTime, func(when time.Time) bool { return !when.After(cursor) })
+
+	// Always advance by at least pageStart so the caller makes progress.
+	return rows, maxTime(cursor, pageStart), true
+}
+
+// filterRows flattens groups, keeping rows whose time satisfies keep. Rows with
+// an unparseable (zero) time are always kept.
+func filterRows[T any](groups [][]T, getTime func(T) time.Time, keep func(time.Time) bool) []T {
+	var rows []T
+
+	for _, group := range groups {
+		for _, row := range group {
+			if when := getTime(row); when.IsZero() || keep(when) {
+				rows = append(rows, row)
+			}
+		}
+	}
+
+	return rows
+}
+
+func maxTime(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+
+	return a
+}
+
+// paginate calls page for consecutive windows from start to now.
+// page fetches and delivers one page and returns the end time it covered.
+// It returns false if a page fails or does not make progress.
+func paginate(start, now time.Time, page func(start, end time.Time) (pageEnd time.Time, ok bool)) bool {
+	for start.Before(now) {
+		end := start.Add(maxQueryDuration)
+		if end.After(now) {
+			end = now
+		}
+
+		pageEnd, ok := page(start, end)
+		if !ok {
+			return false
+		}
+
+		if pageEnd.Before(start) {
+			slog.Error("pagination made no progress, aborting", "start", start, "page_end", pageEnd)
+
+			return false
+		}
+
+		start = pageEnd.Add(time.Nanosecond)
+	}
+
+	return true
+}
+
+// sendBatches calls send for consecutive slices of at most size rows. It stops
+// and returns false on the first failed batch.
+func sendBatches[T any](logs []T, size int, send func([]T) bool) bool {
+	for len(logs) > 0 {
+		count := min(size, len(logs))
+
+		if !send(logs[:count]) {
+			return false
+		}
+
+		logs = logs[count:]
+	}
+
+	return true
 }
 
 func (c *collector) recordMethodSelector(selector string) {
@@ -1289,13 +1370,10 @@ func (c *collector) recordMethodSelector(selector string) {
 	}
 }
 
-// maxPageDepth limits recursion when splitting time windows for pagination.
-const maxPageDepth = 8
-
-// fetchHTTPWindow fetches HTTP request logs for [startTime, endTime], retrying
-// transient failures. ok is false only when fetching ultimately failed,
-// signalling the caller not to advance any checkpoint.
-func (c *collector) fetchHTTPWindow(ctx context.Context, cfg *Config, startTime, endTime time.Time) (entries []LogEntry, succeeded bool) {
+// fetchHTTPWindow fetches one page of HTTP request logs starting at startTime
+// (no later than endTime), retrying transient failures. See fetchEmailWindow for
+// the results.
+func (c *collector) fetchHTTPWindow(ctx context.Context, cfg *Config, startTime, endTime time.Time) (entries []LogEntry, pageEnd time.Time, more, ok bool) {
 	zonesCall := buildZonesCall(cfg.ZoneIDs)
 	selectors := buildMethodSelectors(c.methodSelector)
 	client := &http.Client{Timeout: httpClientTimeout}
@@ -1311,35 +1389,37 @@ func (c *collector) fetchHTTPWindow(ctx context.Context, cfg *Config, startTime,
 			time.Sleep(delay)
 		}
 
-		logs, fetchFailed := c.fetchWithPagination(ctx, client, cfg, zonesCall, selectors, startTime, endTime, 0)
+		groups, fetchFailed := c.fetchHTTPPage(ctx, client, cfg, zonesCall, selectors, startTime, endTime)
 
 		if fetchFailed {
 			// Transient error — retry if we have retries left.
 			if retry == maxFetchRetries {
 				slog.Error("exhausted all retries for Cloudflare fetch", "start", startTime, "end", endTime)
 
-				return nil, false
+				return nil, time.Time{}, false, false
 			}
 
 			continue
 		}
 
 		// Success (or graceful degradation).
-		return logs, true
+		logs, end, hasMore := trimPage(groups, pageLimit, startTime, endTime,
+			func(e LogEntry) time.Time { return parseDatetime(e.Dimensions.Datetime) })
+
+		return logs, end, hasMore, true
 	}
 
 	// Should not reach here, but just in case.
 	slog.Error("fetchHTTPWindow exited unexpectedly")
 
-	return nil, false
+	return nil, time.Time{}, false, false
 }
 
-// fetchWithPagination fetches logs for [startTime, endTime], recursively splitting
-// the window when the API returns 1000 rows (the limit). depth guards against
-// infinite recursion on extremely high-cardinality windows.
-func (c *collector) fetchWithPagination(ctx context.Context, client *http.Client, cfg *Config,
-	zonesCall string, selectors []string, startTime, endTime time.Time, depth int,
-) ([]LogEntry, bool) {
+// fetchHTTPPage fetches one page of logs for [startTime, endTime], grouped per
+// zone, probing method selectors as needed. failed is true on a transient failure.
+func (c *collector) fetchHTTPPage(ctx context.Context, client *http.Client, cfg *Config,
+	zonesCall string, selectors []string, startTime, endTime time.Time,
+) (groups [][]LogEntry, failed bool) {
 	attempt := 0
 	for attempt < len(selectors) {
 		selector := selectors[attempt]
@@ -1360,7 +1440,7 @@ func (c *collector) fetchWithPagination(ctx context.Context, client *http.Client
 			return nil, true // transient failure
 		}
 
-		logs, action, err := c.processGraphQLAttempt(body, selector, selectors, attempt)
+		groups, action, err := c.processGraphQLAttempt(body, selector, selectors, attempt)
 		if err != nil {
 			slog.Error("process response failed", "err", err)
 
@@ -1381,39 +1461,13 @@ func (c *collector) fetchWithPagination(ctx context.Context, client *http.Client
 			c.recordMethodSelector(selector)
 		}
 
-		if len(logs) == 1000 && depth < maxPageDepth {
-			return c.splitFetchWindow(ctx, client, cfg, zonesCall, selectors, startTime, endTime, depth)
-		}
-
-		return logs, false
+		return groups, false
 	}
 
 	// No compatible selector found.
 	slog.Error("no compatible HTTP method field found in Cloudflare schema")
 
 	return nil, false // not a transient failure
-}
-
-// splitFetchWindow splits [startTime, endTime] at the midpoint and fetches each half,
-// used when a fetch returns the 1000-row API limit.
-func (c *collector) splitFetchWindow(ctx context.Context, client *http.Client, cfg *Config,
-	zonesCall string, selectors []string, startTime, endTime time.Time, depth int,
-) ([]LogEntry, bool) {
-	slog.Info("hit 1000-row limit, splitting time window", "depth", depth, "start", startTime, "end", endTime)
-	mid := startTime.Add(endTime.Sub(startTime) / pageSplitDivisor)
-
-	half1, failed1 := c.fetchWithPagination(ctx, client, cfg, zonesCall, selectors, startTime, mid, depth+1)
-	half2, failed2 := c.fetchWithPagination(ctx, client, cfg, zonesCall, selectors, mid, endTime, depth+1)
-
-	if failed1 || failed2 {
-		return nil, true
-	}
-
-	result := make([]LogEntry, 0, len(half1)+len(half2))
-	result = append(result, half1...)
-	result = append(result, half2...)
-
-	return result, false
 }
 
 func unixFloatSeconds(t time.Time) float64 {
@@ -1479,6 +1533,13 @@ func doOpenObserveRequest(ctx context.Context, cfg *Config, body []byte) (int, e
 // empty batch is a success (nothing to send for this window), so the caller
 // advances the checkpoint past an empty window.
 func (c *collector) sendToOpenObserve(ctx context.Context, cfg *Config, logs []LogEntry) bool {
+	return sendBatches(logs, sendBatchSize, func(batch []LogEntry) bool {
+		return c.sendBatchToOpenObserve(ctx, cfg, batch)
+	})
+}
+
+// sendBatchToOpenObserve sends a single batch.
+func (c *collector) sendBatchToOpenObserve(ctx context.Context, cfg *Config, logs []LogEntry) bool {
 	if len(logs) == 0 {
 		return true
 	}
@@ -1575,6 +1636,13 @@ func doSplunkRequest(ctx context.Context, cfg *Config, buf *bytes.Buffer) (int, 
 }
 
 func (c *collector) sendToSplunk(ctx context.Context, cfg *Config, logs []LogEntry) bool {
+	return sendBatches(logs, sendBatchSize, func(batch []LogEntry) bool {
+		return c.sendBatchToSplunk(ctx, cfg, batch)
+	})
+}
+
+// sendBatchToSplunk sends a single batch.
+func (c *collector) sendBatchToSplunk(ctx context.Context, cfg *Config, logs []LogEntry) bool {
 	if len(logs) == 0 {
 		return true
 	}
@@ -1605,6 +1673,13 @@ func (c *collector) sendToSplunk(ctx context.Context, cfg *Config, logs []LogEnt
 }
 
 func (c *collector) sendEmailToOpenObserve(ctx context.Context, cfg *Config, logs []EmailLogEntry) bool {
+	return sendBatches(logs, sendBatchSize, func(batch []EmailLogEntry) bool {
+		return c.sendBatchEmailToOpenObserve(ctx, cfg, batch)
+	})
+}
+
+// sendBatchEmailToOpenObserve sends a single batch.
+func (c *collector) sendBatchEmailToOpenObserve(ctx context.Context, cfg *Config, logs []EmailLogEntry) bool {
 	if len(logs) == 0 {
 		return true
 	}
@@ -1668,6 +1743,13 @@ func buildEmailSplunkPayload(logs []EmailLogEntry) (bytes.Buffer, error) {
 }
 
 func (c *collector) sendEmailToSplunk(ctx context.Context, cfg *Config, logs []EmailLogEntry) bool {
+	return sendBatches(logs, sendBatchSize, func(batch []EmailLogEntry) bool {
+		return c.sendBatchEmailToSplunk(ctx, cfg, batch)
+	})
+}
+
+// sendBatchEmailToSplunk sends a single batch.
+func (c *collector) sendBatchEmailToSplunk(ctx context.Context, cfg *Config, logs []EmailLogEntry) bool {
 	if len(logs) == 0 {
 		return true
 	}
@@ -1698,6 +1780,13 @@ func (c *collector) sendEmailToSplunk(ctx context.Context, cfg *Config, logs []E
 }
 
 func (c *collector) sendR2ToOpenObserve(ctx context.Context, cfg *Config, logs []R2LogEntry) bool {
+	return sendBatches(logs, sendBatchSize, func(batch []R2LogEntry) bool {
+		return c.sendBatchR2ToOpenObserve(ctx, cfg, batch)
+	})
+}
+
+// sendBatchR2ToOpenObserve sends a single batch.
+func (c *collector) sendBatchR2ToOpenObserve(ctx context.Context, cfg *Config, logs []R2LogEntry) bool {
 	if len(logs) == 0 {
 		return true
 	}
@@ -1768,6 +1857,13 @@ func buildR2SplunkPayload(logs []R2LogEntry) (bytes.Buffer, error) {
 }
 
 func (c *collector) sendR2ToSplunk(ctx context.Context, cfg *Config, logs []R2LogEntry) bool {
+	return sendBatches(logs, sendBatchSize, func(batch []R2LogEntry) bool {
+		return c.sendBatchR2ToSplunk(ctx, cfg, batch)
+	})
+}
+
+// sendBatchR2ToSplunk sends a single batch.
+func (c *collector) sendBatchR2ToSplunk(ctx context.Context, cfg *Config, logs []R2LogEntry) bool {
 	if len(logs) == 0 {
 		return true
 	}
@@ -1969,18 +2065,20 @@ func (c *collector) processHTTP(ctx context.Context, cfg *Config, simulate bool)
 
 	start := c.windowStart(datasetHTTP, outputs, now, cfg)
 
-	for _, bound := range chunkBounds(start, now, cfg.BackfillChunk) {
-		logs, succeeded := c.fetchHTTPWindow(ctx, cfg, bound[0], bound[1])
-		if !succeeded {
+	paginate(start, now, func(pageStart, windowEnd time.Time) (time.Time, bool) {
+		logs, pageEnd, more, ok := c.fetchHTTPWindow(ctx, cfg, pageStart, windowEnd)
+		if !ok {
 			// Leave checkpoints untouched; retry from the same point next tick.
-			return
+			return time.Time{}, false
 		}
 
 		slog.Info("collected Cloudflare HTTP logs",
-			"count", len(logs), "start", bound[0], "end", bound[1])
+			"count", len(logs), "start", pageStart, "end", pageEnd, "more", more)
 
-		c.deliverHTTP(ctx, cfg, outputs, logs, bound[1])
-	}
+		c.deliverHTTP(ctx, cfg, outputs, logs, pageEnd)
+
+		return pageEnd, true
+	})
 }
 
 // deliverHTTP sends the chunk's logs to each healthy output (filtered to events
@@ -2036,17 +2134,20 @@ func (c *collector) processR2(ctx context.Context, cfg *Config, simulate bool) {
 
 	start := c.windowStart(datasetR2, outputs, now, cfg)
 
-	for _, bound := range chunkBounds(start, now, cfg.BackfillChunk) {
-		logs, succeeded := c.fetchR2Window(ctx, cfg, bound[0], bound[1])
-		if !succeeded {
-			return
+	paginate(start, now, func(pageStart, windowEnd time.Time) (time.Time, bool) {
+		logs, pageEnd, more, ok := c.fetchR2Window(ctx, cfg, pageStart, windowEnd)
+		if !ok {
+			// Leave checkpoints untouched; retry from the same point next tick.
+			return time.Time{}, false
 		}
 
 		slog.Info("collected Cloudflare R2 logs",
-			"count", len(logs), "start", bound[0], "end", bound[1])
+			"count", len(logs), "start", pageStart, "end", pageEnd, "more", more)
 
-		c.deliverR2(ctx, cfg, outputs, logs, bound[1])
-	}
+		c.deliverR2(ctx, cfg, outputs, logs, pageEnd)
+
+		return pageEnd, true
+	})
 }
 
 func (c *collector) deliverR2(ctx context.Context, cfg *Config, healthy []string, logs []R2LogEntry, chunkEnd time.Time) {
@@ -2099,17 +2200,20 @@ func (c *collector) processEmail(ctx context.Context, cfg *Config, simulate bool
 
 	start := c.windowStart(datasetEmail, outputs, now, cfg)
 
-	for _, bound := range chunkBounds(start, now, cfg.BackfillChunk) {
-		logs, succeeded := c.fetchEmailWindow(ctx, cfg, bound[0], bound[1])
-		if !succeeded {
-			return
+	paginate(start, now, func(pageStart, windowEnd time.Time) (time.Time, bool) {
+		logs, pageEnd, more, ok := c.fetchEmailWindow(ctx, cfg, pageStart, windowEnd)
+		if !ok {
+			// Leave checkpoints untouched; retry from the same point next tick.
+			return time.Time{}, false
 		}
 
 		slog.Info("collected Cloudflare email logs",
-			"count", len(logs), "start", bound[0], "end", bound[1])
+			"count", len(logs), "start", pageStart, "end", pageEnd, "more", more)
 
-		c.deliverEmail(ctx, cfg, outputs, logs, bound[1])
-	}
+		c.deliverEmail(ctx, cfg, outputs, logs, pageEnd)
+
+		return pageEnd, true
+	})
 }
 
 func (c *collector) deliverEmail(ctx context.Context, cfg *Config, healthy []string, logs []EmailLogEntry, chunkEnd time.Time) {
@@ -2268,7 +2372,7 @@ func main() {
 	}
 
 	slog.Info("streaming Cloudflare logs", "state_file", cfg.StateFile,
-		"max_lookback", cfg.MaxLookback, "backfill_chunk", cfg.BackfillChunk)
+		"max_lookback", cfg.MaxLookback)
 
 	if cfg.OpenObserveURL == "" && cfg.SplunkURL == "" {
 		slog.Warn("no destinations configured", "hint", "set openobserve_url or splunk_url")
