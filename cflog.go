@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"text/template"
@@ -36,6 +37,7 @@ const (
 	// dataset and output identifiers used to key per-output checkpoints.
 	datasetHTTP       = "http"
 	datasetR2         = "r2"
+	datasetEmail      = "email"
 	outputOpenObserve = "openobserve"
 	outputSplunk      = "splunk"
 
@@ -44,6 +46,7 @@ const (
 	simMaxBytes    = 4901
 	simBytesOffset = 100
 	simMaxRequests = 5
+	simFlagValues  = 2 // a 0/1 flag has two values
 
 	nanosPerSecond   = 1e9
 	pageSplitDivisor = 2
@@ -88,6 +91,9 @@ type Config struct {
 	StateFile       string
 	MaxLookback     time.Duration
 	BackfillChunk   time.Duration
+
+	EmailRouting        bool
+	EmailIncludeSubject bool
 }
 
 // collector holds per-run mutable state shared across fetch/send operations.
@@ -180,6 +186,22 @@ func applyConfigKey(cfg *Config, key, value string) error {
 
 	if ptr, ok := stringFields[key]; ok {
 		*ptr = value
+
+		return nil
+	}
+
+	boolFields := map[string]*bool{
+		"email_routing":         &cfg.EmailRouting,
+		"email_include_subject": &cfg.EmailIncludeSubject,
+	}
+
+	if ptr, ok := boolFields[key]; ok {
+		b, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("invalid %s %q: %w", key, value, err)
+		}
+
+		*ptr = b
 
 		return nil
 	}
@@ -520,6 +542,76 @@ func simulateCloudFlareLogs() []LogEntry {
 	return logs
 }
 
+// emailPageLimit is the maximum page size for emailRoutingAdaptive.
+const emailPageLimit = 10000
+
+// EmailLogEntry is a single Email Routing event from emailRoutingAdaptive.
+type EmailLogEntry struct {
+	ZoneTag        string `json:"zoneTag"`
+	ZoneName       string `json:"zoneName"`
+	Datetime       string `json:"datetime"`
+	SessionID      string `json:"sessionId"`
+	MessageID      string `json:"messageId"`
+	From           string `json:"from"`
+	To             string `json:"to"`
+	Subject        string `json:"subject,omitempty"`
+	Status         string `json:"status"`
+	Action         string `json:"action"`
+	EventType      string `json:"eventType"`
+	RuleMatched    string `json:"ruleMatched"`
+	SPF            string `json:"spf"`
+	DKIM           string `json:"dkim"`
+	DMARC          string `json:"dmarc"`
+	ARC            string `json:"arc"`
+	ErrorDetail    string `json:"errorDetail"`
+	IsSpam         int    `json:"isSpam"`
+	IsNDR          int    `json:"isNDR"` //nolint:tagliatelle // matches Cloudflare GraphQL field name
+	IsLastEvent    int    `json:"isLastEvent"`
+	SpamScore      int    `json:"spamScore"`
+	SpamThreshold  int    `json:"spamThreshold"`
+	SampleInterval int    `json:"sampleInterval"`
+}
+
+//nolint:gosec // simulation data; cryptographic randomness not required
+func simulateEmailLogs() []EmailLogEntry {
+	statuses := []string{"delivered", "rejected", "dropped"}
+	actions := []string{"forward", "drop", "reject"}
+	verdicts := []string{"pass", "fail", "none"}
+	senders := []string{"alice@example.com", "bob@example.com", "carol@example.com"}
+	recipients := []string{"info@example.com", "support@example.com", "sales@example.com"}
+
+	count := rand.Intn(simMaxCount) + 1
+
+	logs := make([]EmailLogEntry, count)
+	for idx := range logs {
+		logs[idx] = EmailLogEntry{
+			ZoneTag:        "simulated-zone",
+			ZoneName:       "example.com",
+			Datetime:       time.Now().UTC().Format(time.RFC3339Nano),
+			SessionID:      fmt.Sprintf("sim-%016x", rand.Uint64()),
+			MessageID:      fmt.Sprintf("<%08x@example.com>", rand.Uint32()),
+			From:           randFrom(senders),
+			To:             randFrom(recipients),
+			Subject:        "Simulated message",
+			Status:         randFrom(statuses),
+			Action:         randFrom(actions),
+			EventType:      "routing",
+			RuleMatched:    "catch-all",
+			SPF:            randFrom(verdicts),
+			DKIM:           randFrom(verdicts),
+			DMARC:          randFrom(verdicts),
+			ARC:            "none",
+			IsSpam:         rand.Intn(simFlagValues),
+			IsLastEvent:    1,
+			SpamScore:      rand.Intn(simMaxRequests + 1),
+			SpamThreshold:  simMaxRequests,
+			SampleInterval: 1,
+		}
+	}
+
+	return logs
+}
+
 //nolint:gosec // simulation data; cryptographic randomness not required
 func simulateR2Logs() []R2LogEntry {
 	buckets := []string{"my-bucket", "backups", "assets"}
@@ -683,6 +775,72 @@ func buildR2GraphQLQuery(accountID string, startTime, endTime time.Time) string 
 	return buf.String()
 }
 
+// buildEmailGraphQLQuery returns the GraphQL query for emailRoutingAdaptive.
+// The subject field is requested only when includeSubject is true.
+func buildEmailGraphQLQuery(zoneIDs []string, includeSubject bool, startTime, endTime time.Time) string {
+	const tmplText = `{
+  viewer {
+    {{.ZonesCall}} {
+      zoneTag
+      emailRoutingAdaptive(limit: {{.Limit}}, orderBy: [datetime_ASC], filter: {datetime_geq: "{{.Start}}", datetime_leq: "{{.End}}"}) {
+        datetime
+        sessionId
+        messageId
+        from
+        to
+{{- if .IncludeSubject}}
+        subject
+{{- end}}
+        status
+        action
+        eventType
+        ruleMatched
+        spf
+        dkim
+        dmarc
+        arc
+        errorDetail
+        isSpam
+        isNDR
+        isLastEvent
+        spamScore
+        spamThreshold
+        sampleInterval
+      }
+    }
+  }
+}`
+
+	var buf bytes.Buffer
+
+	err := template.Must(template.New("emailgql").Parse(tmplText)).Execute(&buf, map[string]any{
+		"ZonesCall":      buildZonesCall(zoneIDs),
+		"Limit":          emailPageLimit,
+		"IncludeSubject": includeSubject,
+		"Start":          startTime.Format(time.RFC3339Nano),
+		"End":            endTime.Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		panic(fmt.Sprintf("buildEmailGraphQLQuery: template execution failed: %v", err))
+	}
+
+	return buf.String()
+}
+
+type emailGraphQLResponse struct {
+	Data struct {
+		Viewer struct {
+			Zones []struct {
+				ZoneTag              string          `json:"zoneTag"`
+				EmailRoutingAdaptive []EmailLogEntry `json:"emailRoutingAdaptive"`
+			} `json:"zones"`
+		} `json:"viewer"`
+	} `json:"data"`
+	Errors []struct {
+		Message string `json:"message"`
+	} `json:"errors"`
+}
+
 type r2GraphQLResponse struct {
 	Data struct {
 		Viewer struct {
@@ -841,6 +999,144 @@ func (c *collector) processR2Attempt(body []byte) ([]R2LogEntry, error) {
 	return logs, nil
 }
 
+// processEmailAttempt parses an Email Routing response body and extracts log entries.
+func (c *collector) processEmailAttempt(body []byte) ([]EmailLogEntry, error) {
+	var result emailGraphQLResponse
+
+	err := json.Unmarshal(body, &result)
+	if err != nil {
+		return nil, fmt.Errorf("parse email response: %w", err)
+	}
+
+	if len(result.Errors) > 0 {
+		return nil, fmt.Errorf("%w: %s", errGraphQL, result.Errors[0].Message)
+	}
+
+	var logs []EmailLogEntry
+
+	for _, zone := range result.Data.Viewer.Zones {
+		for _, entry := range zone.EmailRoutingAdaptive {
+			entry.ZoneTag = zone.ZoneTag
+			entry.ZoneName = c.zoneNames[zone.ZoneTag]
+			logs = append(logs, entry)
+		}
+	}
+
+	if len(logs) == 0 {
+		slog.Debug("no email logs yet, waiting for traffic")
+
+		return nil, nil
+	}
+
+	return logs, nil
+}
+
+// dedupeEmail removes duplicate events (same sessionId and datetime),
+// preserving the order of first occurrence.
+func dedupeEmail(entries []EmailLogEntry) []EmailLogEntry {
+	seen := make(map[string]struct{}, len(entries))
+	out := make([]EmailLogEntry, 0, len(entries))
+
+	for _, entry := range entries {
+		key := entry.SessionID + "|" + entry.Datetime
+		if _, dup := seen[key]; dup {
+			continue
+		}
+
+		seen[key] = struct{}{}
+
+		out = append(out, entry)
+	}
+
+	return out
+}
+
+// fetchEmailWithPagination fetches Email Routing logs for [startTime, endTime],
+// recursively splitting the window when the API returns a full page.
+func (c *collector) fetchEmailWithPagination(ctx context.Context, client *http.Client, cfg *Config,
+	startTime, endTime time.Time, depth int,
+) ([]EmailLogEntry, bool) {
+	query := buildEmailGraphQLQuery(cfg.ZoneIDs, cfg.EmailIncludeSubject, startTime, endTime)
+
+	body, status, err := doGraphQLRequest(ctx, client, cfg, query)
+	if err != nil {
+		slog.Error("Cloudflare email request failed", "err", err)
+
+		return nil, true // transient failure
+	}
+
+	slog.Debug("Cloudflare email GraphQL response", "body", string(body))
+
+	if status != http.StatusOK {
+		slog.Error("Cloudflare email API error", "status", status, "body", string(body))
+
+		return nil, true // transient failure
+	}
+
+	logs, err := c.processEmailAttempt(body)
+	if err != nil {
+		slog.Error("process email response failed", "err", err)
+
+		return nil, true // transient failure
+	}
+
+	if len(logs) == emailPageLimit && depth < maxPageDepth {
+		slog.Info("hit row limit for email, splitting time window",
+			"limit", emailPageLimit, "depth", depth, "start", startTime, "end", endTime)
+		mid := startTime.Add(endTime.Sub(startTime) / pageSplitDivisor)
+
+		half1, failed1 := c.fetchEmailWithPagination(ctx, client, cfg, startTime, mid, depth+1)
+		half2, failed2 := c.fetchEmailWithPagination(ctx, client, cfg, mid, endTime, depth+1)
+
+		if failed1 || failed2 {
+			return nil, true
+		}
+
+		result := make([]EmailLogEntry, 0, len(half1)+len(half2))
+		result = append(result, half1...)
+		result = append(result, half2...)
+
+		return result, false
+	}
+
+	return logs, false
+}
+
+// fetchEmailWindow fetches Email Routing logs for [startTime, endTime], retrying
+// transient failures. succeeded is false only when fetching ultimately failed,
+// signalling the caller not to advance any checkpoint.
+func (c *collector) fetchEmailWindow(ctx context.Context, cfg *Config, startTime, endTime time.Time) (entries []EmailLogEntry, succeeded bool) {
+	client := &http.Client{Timeout: httpClientTimeout}
+
+	for retry := 0; retry <= maxFetchRetries; retry++ {
+		if retry > 0 {
+			delay := min(
+				retryBaseDelay*(1<<uint(retry-1)), retryMaxDelay)
+
+			slog.Info("retrying Cloudflare email fetch", "retry", retry, "delay", delay, "start", startTime, "end", endTime)
+			time.Sleep(delay)
+		}
+
+		logs, fetchFailed := c.fetchEmailWithPagination(ctx, client, cfg, startTime, endTime, 0)
+
+		if fetchFailed {
+			if retry == maxFetchRetries {
+				slog.Error("exhausted all retries for Cloudflare email fetch", "start", startTime, "end", endTime)
+
+				return nil, false
+			}
+
+			continue
+		}
+
+		return dedupeEmail(logs), true
+	}
+
+	slog.Error("fetchEmailWindow exited unexpectedly")
+
+	return nil, false
+}
+
 // fetchR2WithPagination fetches R2 logs for [startTime, endTime], recursively splitting
 // the window when the API returns 1000 rows (the limit).
 func (c *collector) fetchR2WithPagination(ctx context.Context, client *http.Client, cfg *Config,
@@ -903,7 +1199,7 @@ func (c *collector) fetchR2Window(ctx context.Context, cfg *Config, startTime, e
 		if retry > 0 {
 			delay := min(
 				// 5s, 10s, 20s
-				retryBaseDelay*(1<<uint(retry-1)), retryMaxDelay) //nolint:gosec // retry>0 so retry-1>=0
+				retryBaseDelay*(1<<uint(retry-1)), retryMaxDelay)
 
 			slog.Info("retrying Cloudflare R2 fetch", "retry", retry, "delay", delay, "start", startTime, "end", endTime)
 			time.Sleep(delay)
@@ -1009,7 +1305,7 @@ func (c *collector) fetchHTTPWindow(ctx context.Context, cfg *Config, startTime,
 		if retry > 0 {
 			delay := min(
 				// 5s, 10s, 20s
-				retryBaseDelay*(1<<uint(retry-1)), retryMaxDelay) //nolint:gosec // retry>0 so retry-1>=0
+				retryBaseDelay*(1<<uint(retry-1)), retryMaxDelay)
 
 			slog.Info("retrying Cloudflare fetch", "retry", retry, "delay", delay, "start", startTime, "end", endTime)
 			time.Sleep(delay)
@@ -1304,6 +1600,99 @@ func (c *collector) sendToSplunk(ctx context.Context, cfg *Config, logs []LogEnt
 	}
 
 	slog.Debug("sent logs to Splunk", "count", len(logs), "status", status)
+
+	return true
+}
+
+func (c *collector) sendEmailToOpenObserve(ctx context.Context, cfg *Config, logs []EmailLogEntry) bool {
+	if len(logs) == 0 {
+		return true
+	}
+
+	body, err := json.Marshal(logs)
+	if err != nil {
+		slog.Error("failed to marshal email payload", "err", err)
+
+		return false
+	}
+
+	status, err := doOpenObserveRequest(ctx, cfg, body)
+	if err != nil {
+		slog.Error("OpenObserve email request error", "err", err)
+
+		return false
+	}
+
+	if status < 200 || status >= 300 {
+		slog.Info("OpenObserve email request failed", "count", len(logs), "status", status)
+
+		return false
+	}
+
+	slog.Debug("sent email logs to OpenObserve", "count", len(logs), "status", status)
+
+	return true
+}
+
+func buildEmailSplunkPayload(logs []EmailLogEntry) (bytes.Buffer, error) {
+	var buf bytes.Buffer
+
+	for _, entry := range logs {
+		var eventTime float64
+
+		t, err := time.Parse(time.RFC3339Nano, entry.Datetime)
+		if err == nil {
+			eventTime = unixFloatSeconds(t)
+		}
+
+		envelope := struct {
+			Time       float64       `json:"time,omitempty"`
+			Event      EmailLogEntry `json:"event"`
+			Sourcetype string        `json:"sourcetype"`
+		}{
+			Time:       eventTime,
+			Event:      entry,
+			Sourcetype: "_json",
+		}
+
+		line, err := json.Marshal(envelope)
+		if err != nil {
+			return buf, fmt.Errorf("marshal email Splunk event: %w", err)
+		}
+
+		buf.Write(line)
+		buf.WriteByte('\n')
+	}
+
+	return buf, nil
+}
+
+func (c *collector) sendEmailToSplunk(ctx context.Context, cfg *Config, logs []EmailLogEntry) bool {
+	if len(logs) == 0 {
+		return true
+	}
+
+	buf, err := buildEmailSplunkPayload(logs)
+	if err != nil {
+		slog.Error("failed to build email Splunk payload", "err", err)
+
+		return false
+	}
+
+	status, err := doSplunkRequest(ctx, cfg, &buf)
+	if err != nil {
+		slog.Error("email Splunk request error", "err", err)
+
+		return false
+	}
+
+	if status < 200 || status >= 300 {
+		slog.Info("email Splunk request failed", "count", len(logs), "status", status)
+
+		return false
+	}
+
+	slog.Debug("sent email logs to Splunk", "count", len(logs), "status", status)
 
 	return true
 }
@@ -1684,6 +2073,69 @@ func (c *collector) deliverR2(ctx context.Context, cfg *Config, healthy []string
 	}
 }
 
+// processEmail mirrors processR2 for Email Routing logs.
+func (c *collector) processEmail(ctx context.Context, cfg *Config, simulate bool) {
+	if !cfg.EmailRouting {
+		slog.Debug("email routing collection skipped: email_routing not enabled")
+
+		return
+	}
+
+	outputs := enabledOutputs(cfg)
+	if len(outputs) == 0 {
+		return
+	}
+
+	// Advisory probe only; deliver to every enabled output. See processHTTP.
+	c.healthyOutputs(ctx, cfg, outputs)
+
+	now := time.Now().UTC()
+
+	if simulate {
+		c.deliverEmail(ctx, cfg, outputs, simulateEmailLogs(), now)
+
+		return
+	}
+
+	start := c.windowStart(datasetEmail, outputs, now, cfg)
+
+	for _, bound := range chunkBounds(start, now, cfg.BackfillChunk) {
+		logs, succeeded := c.fetchEmailWindow(ctx, cfg, bound[0], bound[1])
+		if !succeeded {
+			return
+		}
+
+		slog.Info("collected Cloudflare email logs",
+			"count", len(logs), "start", bound[0], "end", bound[1])
+
+		c.deliverEmail(ctx, cfg, outputs, logs, bound[1])
+	}
+}
+
+func (c *collector) deliverEmail(ctx context.Context, cfg *Config, healthy []string, logs []EmailLogEntry, chunkEnd time.Time) {
+	for _, out := range healthy {
+		checkpoint := c.store.get(datasetEmail, out)
+		if !chunkEnd.After(checkpoint) {
+			continue
+		}
+
+		filtered := afterCheckpoint(logs, checkpoint, func(e EmailLogEntry) string { return e.Datetime })
+
+		var delivered bool
+
+		switch out {
+		case outputOpenObserve:
+			delivered = c.sendEmailToOpenObserve(ctx, cfg, filtered)
+		case outputSplunk:
+			delivered = c.sendEmailToSplunk(ctx, cfg, filtered)
+		}
+
+		if delivered {
+			c.store.advance(datasetEmail, out, chunkEnd)
+		}
+	}
+}
+
 func (c *collector) fetchAllZoneIDs(ctx context.Context, cfg *Config) ([]string, error) {
 	client := &http.Client{Timeout: httpClientTimeout}
 	page := 1
@@ -1834,6 +2286,7 @@ func main() {
 
 			col.processHTTP(ctx, cfg, *simulate)
 			col.processR2(ctx, cfg, *simulate)
+			col.processEmail(ctx, cfg, *simulate)
 		}()
 		time.Sleep(cfg.PollInterval)
 	}

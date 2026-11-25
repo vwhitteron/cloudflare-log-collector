@@ -1,0 +1,11 @@
+services:
+  cflog:
+    build:
+      context: https://github.com/vwhitteron/cloudflare-log-collector.git
+    image: cflog:latest
+    pull_policy: build
+    restart: unless-stopped
+    volumes:
+      - ./app/cflog/cflog.conf:/opt/cflog/cflog.conf:ro
+      - ./app/cflog/state:/var/opt/cflog:rw
+    #command: ["--config", "/opt/cflog/cflog.conf", "--debug"]

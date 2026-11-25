@@ -1,10 +1,10 @@
 # cloudflare-log-collector
 
-A Go daemon that polls Cloudflare's GraphQL Analytics API and forwards HTTP request logs and R2 storage metrics to [OpenObserve](https://openobserve.ai) or [Splunk](https://splunk.com).
+A Go daemon that polls Cloudflare's GraphQL Analytics API and forwards HTTP request logs, R2 storage metrics and Email Routing logs to [OpenObserve](https://openobserve.ai) or [Splunk](https://splunk.com).
 
 ## Features
 
-- Polls Cloudflare zone HTTP logs and R2 access logs on a configurable interval
+- Polls Cloudflare zone HTTP logs, R2 access logs and (optionally) Email Routing logs on a configurable interval
 - Forwards to OpenObserve (via HTTP ingest) or Splunk (via HEC)
 - Supports multiple zones; auto-discovers all zones if none specified
 - Gracefully handles plan-restricted GraphQL fields per zone
@@ -36,6 +36,10 @@ cloudflareemail       = user@example.com
 cloudflare_zone_ids   = zone1.example.com,zone2.example.com   # omit for all zones
 cloudflare_account_id = <account id>                          # required for R2 logs
 
+# Optional: Email Routing logs (zone-scoped, disabled by default)
+email_routing         = false  # set to true to collect Email Routing logs
+email_include_subject = false  # include the message subject (personal data)
+
 # Optional: remove or comment out if not required
 openobserve_url       = https://openobserve.exmaple.com/api/default/default/_json
 openobserve_user      = cflog@example.com
@@ -50,6 +54,17 @@ state_file            = /var/opt/cflog/state.json  # per-output checkpoints; uns
 max_lookback          = 72h                        # cap on backfill after downtime (default 72h)
 backfill_chunk        = 15m                        # fetch window size; defaults to poll_interval
 ```
+
+### Email Routing logs
+
+Set `email_routing = true` to collect Email Routing events (`emailRoutingAdaptive`)
+for the configured zones. Each row is an individual event and is forwarded as-is.
+Cloudflare retains Email Routing analytics for 31 days, so `max_lookback` is
+effectively capped at 31 days for this dataset.
+
+The `from`, `to` and (when `email_include_subject = true`) `subject` fields are
+personal data. The subject is omitted by default; enable it only if you have a
+legitimate need and appropriate controls on the destination.
 
 ### Gap recovery
 
