@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -146,5 +147,47 @@ func TestBuildEmailSplunkPayload(t *testing.T) {
 		if !strings.Contains(l, `"time":`) || !strings.Contains(l, `"sourcetype":"_json"`) {
 			t.Errorf("line missing time/sourcetype: %s", l)
 		}
+	}
+}
+
+func TestApplyConfigKeyIngestDelay(t *testing.T) {
+	t.Parallel()
+
+	cfg := &Config{}
+
+	err := applyConfigKey(cfg, "ingest_delay", "10m")
+	if err != nil || cfg.IngestDelay != 10*time.Minute {
+		t.Errorf("ingest_delay not set: err=%v value=%v", err, cfg.IngestDelay)
+	}
+
+	err = applyConfigKey(cfg, "ingest_delay", "0s")
+	if err != nil || cfg.IngestDelay != 0 {
+		t.Errorf("ingest_delay 0s not accepted: err=%v", err)
+	}
+
+	for _, bad := range []string{"-1m", "soon"} {
+		if applyConfigKey(cfg, "ingest_delay", bad) == nil {
+			t.Errorf("expected error for ingest_delay %q", bad)
+		}
+	}
+}
+
+func TestLoadConfigDefaultIngestDelay(t *testing.T) {
+	t.Parallel()
+
+	path := t.TempDir() + "/cflog.conf"
+
+	err := os.WriteFile(path, []byte("poll_interval = 60s\n"), 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if cfg.IngestDelay != defaultIngestDelay {
+		t.Errorf("IngestDelay = %v, want %v", cfg.IngestDelay, defaultIngestDelay)
 	}
 }

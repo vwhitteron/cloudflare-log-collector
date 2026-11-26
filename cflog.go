@@ -30,7 +30,8 @@ const (
 	httpClientTimeout   = 30 * time.Second
 
 	// gap-recovery defaults.
-	defaultMaxLookback = 72 * time.Hour // Cloudflare adaptive datasets retain ~72h.
+	defaultMaxLookback = 72 * time.Hour  // Cloudflare adaptive datasets retain ~72h.
+	defaultIngestDelay = 5 * time.Minute // Cloudflare adds analytics rows minutes after the event.
 	healthCheckTimeout = 5 * time.Second
 	stateDirPerm       = 0o755
 
@@ -71,6 +72,7 @@ const (
 var (
 	errGraphQL      = errors.New("GraphQL error")
 	errMalformedURL = errors.New("malformed url")
+	errIngestDelay  = errors.New("must be a non-negative duration")
 )
 
 type retryKind int
@@ -94,6 +96,7 @@ type Config struct {
 	PollInterval    time.Duration
 	StateFile       string
 	MaxLookback     time.Duration
+	IngestDelay     time.Duration
 
 	EmailRouting        bool
 	EmailIncludeSubject bool
@@ -225,6 +228,13 @@ func applyConfigKey(cfg *Config, key, value string) error {
 		}
 
 		cfg.MaxLookback = d
+	case "ingest_delay":
+		d, err := time.ParseDuration(value)
+		if err != nil || d < 0 {
+			return fmt.Errorf("invalid ingest_delay %q: %w", value, errIngestDelay)
+		}
+
+		cfg.IngestDelay = d
 	case "backfill_chunk":
 		slog.Warn("backfill_chunk is deprecated and ignored; pagination is automatic")
 	}
@@ -242,7 +252,7 @@ func loadConfig(path string) (*Config, error) {
 		_ = file.Close()
 	}()
 
-	cfg := &Config{}
+	cfg := &Config{IngestDelay: defaultIngestDelay}
 
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
@@ -2063,9 +2073,11 @@ func (c *collector) processHTTP(ctx context.Context, cfg *Config, simulate bool)
 		return
 	}
 
-	start := c.windowStart(datasetHTTP, outputs, now, cfg)
+	// Stop short of now so the checkpoint never passes rows Cloudflare has not added yet.
+	end := now.Add(-cfg.IngestDelay)
+	start := c.windowStart(datasetHTTP, outputs, end, cfg)
 
-	paginate(start, now, func(pageStart, windowEnd time.Time) (time.Time, bool) {
+	paginate(start, end, func(pageStart, windowEnd time.Time) (time.Time, bool) {
 		logs, pageEnd, more, ok := c.fetchHTTPWindow(ctx, cfg, pageStart, windowEnd)
 		if !ok {
 			// Leave checkpoints untouched; retry from the same point next tick.
@@ -2132,9 +2144,11 @@ func (c *collector) processR2(ctx context.Context, cfg *Config, simulate bool) {
 		return
 	}
 
-	start := c.windowStart(datasetR2, outputs, now, cfg)
+	// Stop short of now so the checkpoint never passes rows Cloudflare has not added yet.
+	end := now.Add(-cfg.IngestDelay)
+	start := c.windowStart(datasetR2, outputs, end, cfg)
 
-	paginate(start, now, func(pageStart, windowEnd time.Time) (time.Time, bool) {
+	paginate(start, end, func(pageStart, windowEnd time.Time) (time.Time, bool) {
 		logs, pageEnd, more, ok := c.fetchR2Window(ctx, cfg, pageStart, windowEnd)
 		if !ok {
 			// Leave checkpoints untouched; retry from the same point next tick.
@@ -2198,9 +2212,11 @@ func (c *collector) processEmail(ctx context.Context, cfg *Config, simulate bool
 		return
 	}
 
-	start := c.windowStart(datasetEmail, outputs, now, cfg)
+	// Stop short of now so the checkpoint never passes rows Cloudflare has not added yet.
+	end := now.Add(-cfg.IngestDelay)
+	start := c.windowStart(datasetEmail, outputs, end, cfg)
 
-	paginate(start, now, func(pageStart, windowEnd time.Time) (time.Time, bool) {
+	paginate(start, end, func(pageStart, windowEnd time.Time) (time.Time, bool) {
 		logs, pageEnd, more, ok := c.fetchEmailWindow(ctx, cfg, pageStart, windowEnd)
 		if !ok {
 			// Leave checkpoints untouched; retry from the same point next tick.
@@ -2372,7 +2388,7 @@ func main() {
 	}
 
 	slog.Info("streaming Cloudflare logs", "state_file", cfg.StateFile,
-		"max_lookback", cfg.MaxLookback)
+		"max_lookback", cfg.MaxLookback, "ingest_delay", cfg.IngestDelay)
 
 	if cfg.OpenObserveURL == "" && cfg.SplunkURL == "" {
 		slog.Warn("no destinations configured", "hint", "set openobserve_url or splunk_url")

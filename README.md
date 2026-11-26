@@ -52,6 +52,7 @@ splunk_token          = secret-token
 # Gap recovery (all optional)
 state_file            = /var/opt/cflog/state.json  # per-output checkpoints; unset disables persistence
 max_lookback          = 72h                        # cap on backfill after downtime (default 72h)
+ingest_delay          = 5m                         # collect only data older than this (default 5m)
 ```
 
 ### Email Routing logs
@@ -74,7 +75,9 @@ collector backfills everything since that output's last successful write, up to
 `max_lookback` (Cloudflare's adaptive datasets retain 31 days or more, depending
 on dataset and plan, so older gaps cannot be recovered). The collector queries from the checkpoint to now, sorted by
 time, up to 10,000 rows per zone per request, and continues from the last
-timestamp when a page is full. An output with
+timestamp when a page is full. Each query stops `ingest_delay` before now, because
+Cloudflare adds analytics rows some minutes after the event; a smaller value can
+lose rows that arrive late. An output with
 no checkpoint yet (first start, or a newly added output) backfills the full
 `max_lookback` window. With `state_file` unset, this happens on every restart
 and can send duplicate events. Each tick the
